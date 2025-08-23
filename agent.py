@@ -1,5 +1,6 @@
 import base64
 import requests
+import os
 from io import BytesIO
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, END
@@ -13,10 +14,24 @@ import PIL
 from PIL import Image
 from langchain_core.messages import AIMessage
 import urllib.parse
+from supabase import create_client, Client
+import io
+import tempfile
+from dotenv import load_dotenv
 
 
-GeminiAPI_key ="AIzaSyCbD5wFBW1tbVbf66iIMcNuUHsvmcw-VCg"
-IMAGE_GEMINI_API = "AIzaSyBVcfxOCoS4zf-f1JDVhHaiA7qJPLhf3hQ"
+load_dotenv()
+
+# SuperBase
+superBaseUrl = os.getenv("superBaseUrl")
+superBaseKey = os.getenv("superBaseKey")
+
+supabase = create_client(superBaseUrl, superBaseKey)
+sceneImageBucket = "Scene_Images"
+
+
+GeminiAPI_key = os.getenv("GeminiAPI_key")
+IMAGE_GEMINI_API = os.getenv("IMAGE_GEMINI_API")
 
 art_style = "Manhwa"
 
@@ -34,6 +49,7 @@ class VNstate(TypedDict):
   scenes: list[str]
   currentSceneData: SceneData
   current_scene_prompt: str
+  currentSceneUrl: str
   scene_images: str
   character_prompts: list[str]
   characters: list[str]
@@ -57,6 +73,7 @@ class Agent:
     graph.add_node("generate_scene",self.generate_scene)
     graph.add_node("check_completion",self.check_completion)
     graph.add_node("generate_scene_prompt", self.generate_scene_prompt)
+    graph.add_node("insert_to_database",self.insert_to_database)
 
     graph.set_entry_point("start")
     graph.add_edge("start","get_characters")
@@ -64,7 +81,8 @@ class Agent:
     graph.add_edge("create_character_prompt","generate_character_portrait")
     graph.add_edge("generate_character_portrait","generate_scene_prompt")
     graph.add_edge("generate_scene_prompt","generate_scene")
-    graph.add_conditional_edges("generate_scene", self.check_completion, {True: END, False:"get_characters"})
+    graph.add_edge("generate_scene","insert_to_database")
+    graph.add_conditional_edges("insert_to_database", self.check_completion, {True: END, False:"get_characters"})
     self.graph = graph.compile()
 
   def split_scenes(self, state):
@@ -230,9 +248,11 @@ class Agent:
     return {"character_prompts": character_prompts, "characters": characters, "new_characters": new_characters}
 
   def generate_character_portrait(self,state):
+    print("generating charecter portrait")
     characters = state["new_characters"]
 
     character_prompts = state["character_prompts"]
+    print(len(character_prompts[0].content))
     allImages = state["character_portrait"]
     allImageData = state["character_portrait_data"]
 
@@ -257,6 +277,7 @@ class Agent:
       image_data = base64.b64decode(image_base64)
       image = Image.open(BytesIO(image_data))
       url = self.uploadImage(image_data)
+      print(url)
       allImages[characters[i]] = url
       allImageData[characters[i]] = image_data
 
@@ -308,16 +329,18 @@ class Agent:
             - Color grading should reflect tone (warm sunset, cold moonlight, neon glow, etc.).
 
             5. CONTEXT & SYMBOLISM:
+            - If the current scene doesnt have or need any charecter to be displayed do not add any unnecessary characters in the scene  
             - Subtle foreshadowing elements from the chapter (shadows, background hints, symbolic objects).
             - Absolute continuity with established designs and previous scenes.
 
             OUTPUT FORMAT:
-            - Respond in one cohesive paragraph (200–300 words), describing the scene in vivid anime detail.
+            - Respond in one cohesive paragraph , describing the scene in vivid anime detail.
             - Always end with: "Aspect ratio: 16:9, resolution: 1920x1080 Full HD, horizontal composition optimized for displaying above text."
 
             !! QUALITY PRIORITY !!
             - Ensure **faces and eyes are flawless**, while maintaining equally high detail in clothing, anatomy, and background.
             - No blurry elements, no low-resolution output, no distorted features.
+
           """
 
     result = self.gemini.invoke(prompt)
@@ -325,13 +348,19 @@ class Agent:
 
 
   def generate_scene(self,state):
+    print("generating images for scene : " , self.currentScene_counter)
+
     current_scene_prompt = state["current_scene_prompt"]
+    temp = "Generate an Anime Style Image"
+    current_scene_prompt = temp + current_scene_prompt
+
     fullChapter = state["fullChapter"]
     currentScene = state["scenes"][self.currentScene_counter]
     previousSceneImage = state["scene_images"]
     characterPortraits = []
+    public_url = ""
     for character in state['currentSceneData'].characters:
-        characterPortraits.append(state['character_portrait_data'][character])
+        characterPortraits.append(state['character_portrait'][character])
 
 
     pollinations_params = {
@@ -340,19 +369,37 @@ class Agent:
         "seed": 41,
         "model": "flux",
         "nologo": "true",
+        "image": characterPortraits
     }
     encoded_prompt = urllib.parse.quote(current_scene_prompt)
     url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
 
     try:
-        response = requests.get(url, params=pollinations_params, timeout=300) # Increased timeout for image generation
-        response.raise_for_status() # Raise an exception for bad status codes
-        url = self.uploadImage(response.content)
+        response = requests.get(url, params=pollinations_params, timeout=300) 
+        response.raise_for_status()
+        file_name = "Scene : " + str(self.currentScene_counter)
+        file_bytes = response.content
+        upload_response = supabase.storage.from_(sceneImageBucket).upload(
+        path=file_name,
+        file=file_bytes,
+        file_options={"content-type": "image/png"}
+        )
+        # Check if upload was successful
+        if upload_response:
+            # Get the public URL
+            public_url = supabase.storage.from_(sceneImageBucket).get_public_url(file_name)
+            print(f"Image URL: {public_url}")
+        else:
+            print("Upload failed")
 
     except requests.exceptions.RequestException as e:
-        print(f"Error fetching image: {e}")
+        print(f"Error fetching image: Retrying")
+        response = requests.get(url, params=pollinations_params, timeout=300)
+        response.raise_for_status() 
+        url = self.uploadImage(response.content)
+        print(url)
 
-    return {"scene_images": url}
+    return {"scene_images": url , "currentSceneUrl": public_url}
 
 
   def uploadImage(self, images, filename="image.png"):
@@ -362,6 +409,20 @@ class Agent:
     file_info = data["files"][0]
     url = file_info["url"]
     return url
+  
+  def insert_to_database(self,state):
+     id = self.currentScene_counter
+     scene = state["scenes"][self.currentScene_counter]
+     scene_url = state["currentSceneUrl"]
+
+     data = {
+        "id" : id,
+        "scene" : scene,
+        "scene_url" : scene_url
+     }
+
+     response = supabase.table("scenes").insert(data).execute()
+     print(response)
 
   def check_completion(self,state):
     if self.currentScene_counter == len(state["scenes"]):

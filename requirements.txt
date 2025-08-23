@@ -1,3 +1,6 @@
 google-genai
 langchain-google-genai
 langgraph
+pillow
+supabase
+dotenv
