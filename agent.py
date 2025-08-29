@@ -18,7 +18,15 @@ from supabase import create_client, Client
 import io
 import tempfile
 from dotenv import load_dotenv
+from fastapi import FastAPI, Form
+from fastapi.middleware.cors import CORSMiddleware
 
+from fastapi.responses import StreamingResponse
+import asyncio
+import json
+from collections import defaultdict
+import uuid
+import uvicorn
 
 load_dotenv()
 
@@ -28,12 +36,24 @@ superBaseKey = os.getenv("superBaseKey")
 
 supabase = create_client(superBaseUrl, superBaseKey)
 sceneImageBucket = "Scene_Images"
+characterPortraitBucket = "Character_Portraits"
 
 
 GeminiAPI_key = os.getenv("GeminiAPI_key")
 IMAGE_GEMINI_API = os.getenv("IMAGE_GEMINI_API")
 
-art_style = "Manhwa"
+fastAPI = FastAPI()
+fastAPI.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods (GET, POST, etc.)
+    allow_headers=["*"],  # Allows all headers
+)
+
+# Store active SSE connections
+active_connections = {}
+
 
 class Dialauges(BaseModel):
   character: str
@@ -44,26 +64,27 @@ class SceneData(BaseModel):
     characters: list[str]
     dialogues: list[Dialauges]
 
+class Chapter(BaseModel):
+   fullChapter: str
+
 class VNstate(TypedDict):
   fullChapter: str
   scenes: list[str]
   currentSceneData: SceneData
   current_scene_prompt: str
   currentSceneUrl: str
-  scene_images: str
   character_prompts: list[str]
   characters: list[str]
   new_characters: list[str]
   character_portrait: dict[str, str]
   character_portrait_data: dict[str, str]
-  image_prompts: str
-  voice_prompts: str
 
 class Agent:
-  def __init__(self, gemini, img_model):
+  def __init__(self, gemini, img_model, connection_id: str = None):
     self.image_model = img_model
     self.gemini = gemini
-    self.currentScene_counter = 1
+    self.currentScene_counter = 0
+    self.connection_id = connection_id 
 
     graph = StateGraph(VNstate)
     graph.add_node("start",self.split_scenes)
@@ -89,10 +110,12 @@ class Agent:
     fullChapter = state["fullChapter"]
     state["characters"] = []
     scenes = [p.strip() for p in fullChapter.strip().split("\n\n") if p.strip()]
-
-    return {"scenes":scenes, "characters": [], "new_characters": [], "scene_images": {}, "character_portrait": {}, "character_prompts": [], "character_portrait_data": {}}
+    print("No. of Scenes: ", len(scenes))
+    return {"scenes":scenes, "characters": [], "new_characters": [], "character_portrait": {}, "character_prompts": [], "currentSceneUrl": "", "character_portrait_data": {}}
 
   def get_characters(self,state):
+    debug_state(self,state)
+
     fullChapter = state["fullChapter"]
     currentScene = state["scenes"][self.currentScene_counter]
 
@@ -154,6 +177,7 @@ class Agent:
 
 
   def create_character_prompt(self,state):
+    print("Creating Character Prompts")
     new_characters = []
     current_scene_characters = state["currentSceneData"].characters
     characters = state["characters"]
@@ -217,7 +241,7 @@ class Agent:
         - Reference sheet quality presentation
 
         **ARTISTIC STYLE:**
-        {art_style}
+        - Manhwa
 
         **REFERENCE SHEET STANDARDS:**
         - Consistent proportions that can be replicated
@@ -252,7 +276,6 @@ class Agent:
     characters = state["new_characters"]
 
     character_prompts = state["character_prompts"]
-    print(len(character_prompts[0].content))
     allImages = state["character_portrait"]
     allImageData = state["character_portrait_data"]
 
@@ -275,18 +298,19 @@ class Agent:
       )
       image_base64 = _get_image_base64(response)
       image_data = base64.b64decode(image_base64)
-      image = Image.open(BytesIO(image_data))
-      url = self.uploadImage(image_data)
-      print(url)
+      file_name = "Character:"+ str(i)
+      bucket = characterPortraitBucket
+      url = self.uploadImage(file_name, image_data, bucket)
       allImages[characters[i]] = url
       allImageData[characters[i]] = image_data
 
     return {"character_portrait" : allImages, "character_portrait_data": allImageData}
 
   def generate_scene_prompt(self, state):
+    print("Generating scene prompt")
     fullChapter = state["fullChapter"]
     currentScene = state["scenes"][self.currentScene_counter]
-    previousSceneImage = state["scene_images"]
+    previousSceneImage = state.get("currentSceneUrl", "")
     characterPortraits = []
     for character in state['currentSceneData'].characters:
         characterPortraits.append(state['character_portrait'][character])
@@ -356,7 +380,7 @@ class Agent:
 
     fullChapter = state["fullChapter"]
     currentScene = state["scenes"][self.currentScene_counter]
-    previousSceneImage = state["scene_images"]
+    previousSceneImage = state.get("currentSceneUrl", "")
     characterPortraits = []
     public_url = ""
     for character in state['currentSceneData'].characters:
@@ -377,61 +401,97 @@ class Agent:
     try:
         response = requests.get(url, params=pollinations_params, timeout=300) 
         response.raise_for_status()
-        file_name = "Scene : " + str(self.currentScene_counter)
+        file_name = "Scene:" + str(self.currentScene_counter)
         file_bytes = response.content
-        upload_response = supabase.storage.from_(sceneImageBucket).upload(
-        path=file_name,
-        file=file_bytes,
-        file_options={"content-type": "image/png"}
-        )
-        # Check if upload was successful
-        if upload_response:
-            # Get the public URL
-            public_url = supabase.storage.from_(sceneImageBucket).get_public_url(file_name)
-            print(f"Image URL: {public_url}")
-        else:
-            print("Upload failed")
+        bucket = sceneImageBucket
+        upload_response = self.uploadImage(file_name, file_bytes, bucket)
 
     except requests.exceptions.RequestException as e:
         print(f"Error fetching image: Retrying")
-        response = requests.get(url, params=pollinations_params, timeout=300)
-        response.raise_for_status() 
-        url = self.uploadImage(response.content)
-        print(url)
+        response = requests.get(url, params=pollinations_params, timeout=300) 
+        response.raise_for_status()
+        file_name = "Scene:" + str(self.currentScene_counter)
+        file_bytes = response.content
+        bucket = sceneImageBucket
+        upload_response = self.uploadImage(file_name, file_bytes, bucket)
 
-    return {"scene_images": url , "currentSceneUrl": public_url}
+    return {"currentSceneUrl": upload_response}
 
 
-  def uploadImage(self, images, filename="image.png"):
-    files = {"files[]": (filename, images, "image/png")}
-    r = requests.post("https://uguu.se/upload", files=files)
-    data = json.loads(r.text)
-    file_info = data["files"][0]
-    url = file_info["url"]
-    return url
+  def uploadImage(self, file_name, file_bytes, bucket):
+    print("uploading images in :"+bucket)
+    upload_response = supabase.storage.from_(bucket).upload(
+    path=file_name,
+    file=file_bytes,
+    file_options={"content-type": "image/png"}
+    )
+    # Check if upload was successful
+    if upload_response:
+        # Get the public URL
+        public_url = supabase.storage.from_(sceneImageBucket).get_public_url(file_name)
+        print(f"Image URL: {public_url}")
+    else:
+        print("Upload failed")
+    return public_url
   
   def insert_to_database(self,state):
-     id = self.currentScene_counter
-     scene = state["scenes"][self.currentScene_counter]
-     scene_url = state["currentSceneUrl"]
+    try:
+      print(f"Inserting Data for Scene: {self.currentScene_counter}")
+      id = self.currentScene_counter
+      scene = state["scenes"][self.currentScene_counter]
+      scene_url = state.get("currentSceneUrl","")
 
-     data = {
-        "id" : id,
-        "scene" : scene,
-        "scene_url" : scene_url
-     }
-
-     response = supabase.table("scenes").insert(data).execute()
-     print(response)
+      data = {
+          "id" : id,
+          "scene" : scene,
+          "scene_url" : scene_url
+      }
+      
+      response = supabase.table("scenes").insert(data).execute()
+    except Exception as e:
+      print("Insertion Failed", e)
 
   def check_completion(self,state):
-    if self.currentScene_counter == len(state["scenes"]):
+    if self.currentScene_counter == len(state["scenes"])-1:
+      # All scenes completed
+      if self.connection_id and self.connection_id in active_connections:
+        final_data = {
+          "total_scenes": len(state["scenes"]),
+          "completed_scenes": len(state["scenes"]),
+          "status": "all_completed"
+        }
+        try:
+          active_connections[self.connection_id].put_nowait(final_data)
+        except:
+          pass
       return True
     else:
+      if self.connection_id and self.connection_id in active_connections:
+        scene_completed_data = {
+          "scene_id": self.currentScene_counter,
+          "total_scenes": len(state["scenes"]),
+          "completed_scenes": self.currentScene_counter + 1,
+          "status": "scene_completed"
+        }
+        # Send notification (non-blocking)
+        try:
+          active_connections[self.connection_id].put_nowait(scene_completed_data)
+        except:
+          pass
       self.currentScene_counter += 1
       return False
 
-def main():
+def debug_state(self, state):
+    print(f"Current scene counter: {self.currentScene_counter}")
+    print(f"Total scenes: {len(state.get('scenes', []))}")
+    print(f"Characters: {len(state.get('characters', []))}")
+    print(f"New characters: {len(state.get('new_characters', []))}")
+    print(f"Character prompts: {len(state.get('character_prompts', []))}")
+    print("=" * 30)
+
+
+def main(fullChapter, connection_id: str = None):
+    
     image_model = ChatGoogleGenerativeAI(
         model="models/gemini-2.0-flash-preview-image-generation",
         google_api_key=IMAGE_GEMINI_API
@@ -441,11 +501,84 @@ def main():
         google_api_key=GeminiAPI_key,
     )
 
-    with open("chapter.txt", "r", encoding="utf-8") as file:
-        text_content = file.read()
+    agent = Agent(gemini, image_model, connection_id)
+    return agent.graph.invoke({"fullChapter": fullChapter}, config={"recursion_limit": 150})
 
-    agent = Agent(gemini, image_model)
-    return agent.graph.invoke({"fullChapter": text_content}, config={"recursion_limit": 150})
 
-result = main()
+@fastAPI.post("/uploadChapter")
+async def root(fullChapter: str = Form()):    
+    try:
+       connection_id = str(uuid.uuid4()) 
+       
+       # Create a queue for this connection
+       active_connections[connection_id] = asyncio.Queue() 
+       
+       # Start processing in background
+       asyncio.create_task(process_chapter_with_updates(fullChapter, connection_id)) 
+       
+       return {"message": "Processing started", "connection_id": connection_id}  
+    except Exception as e:
+       return {"message": "Process Failed", "Error": str(e)}
+
+# ====== ADD THIS NEW BACKGROUND TASK ======
+async def process_chapter_with_updates(fullChapter: str, connection_id: str):
+    try:
+        result = main(fullChapter, connection_id)
+        # Process completed, cleanup
+        if connection_id in active_connections:
+            del active_connections[connection_id]
+    except Exception as e:
+        # Send error notification
+        if connection_id in active_connections:
+            error_data = {"status": "error", "error": str(e)}
+            print(error_data)
+            try:
+                active_connections[connection_id].put_nowait(error_data)
+            except:
+                pass
+
+# ====== ADD THIS NEW SSE ENDPOINT ======
+@fastAPI.get("/progress/{connection_id}")
+async def get_progress_stream(connection_id: str):
+    if connection_id not in active_connections:
+        return {"error": "Connection not found"}
+    
+    async def event_generator():
+        try:
+            while connection_id in active_connections:
+                try:
+                    # Wait for updates from the processing
+                    data = await asyncio.wait_for(
+                        active_connections[connection_id].get(), 
+                        timeout=30.0
+                    )
+                    
+                    yield f"data: {json.dumps(data)}\n\n"
+                    
+                    # If all completed or error, end stream
+                    if data.get("status") in ["all_completed", "error"]:
+                        break
+                        
+                except asyncio.TimeoutError:
+                    # Send heartbeat
+                    yield f"data: {json.dumps({'status': 'processing'})}\n\n"
+                    
+        finally:
+            # Cleanup connection
+            if connection_id in active_connections:
+                del active_connections[connection_id]
+    
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        }
+    )
+
+
+if __name__ == "__main__":
+    uvicorn.run("agent:fastAPI", host="0.0.0.0", port=8000, reload=True)
+
 

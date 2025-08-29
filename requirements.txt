@@ -4,3 +4,5 @@ langgraph
 pillow
 supabase
 dotenv
+fastapi[standard]
+uvicorn
