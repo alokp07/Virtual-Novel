@@ -9,6 +9,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from typing import List
 from pydantic import BaseModel, Field
 import json
+import re
 from typing import Dict
 import PIL
 from PIL import Image
@@ -45,10 +46,10 @@ IMAGE_GEMINI_API = os.getenv("IMAGE_GEMINI_API")
 fastAPI = FastAPI()
 fastAPI.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods (GET, POST, etc.)
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Store active SSE connections
@@ -77,7 +78,6 @@ class VNstate(TypedDict):
   characters: list[str]
   new_characters: list[str]
   character_portrait: dict[str, str]
-  character_portrait_data: dict[str, str]
 
 class Agent:
   def __init__(self, gemini, img_model, connection_id: str = None):
@@ -107,13 +107,23 @@ class Agent:
     self.graph = graph.compile()
 
   def split_scenes(self, state):
+    print("Splitting Scenes")
+    clean_supabase()
     fullChapter = state["fullChapter"]
     state["characters"] = []
-    scenes = [p.strip() for p in fullChapter.strip().split("\n\n") if p.strip()]
-    print("No. of Scenes: ", len(scenes))
-    return {"scenes":scenes, "characters": [], "new_characters": [], "character_portrait": {}, "character_prompts": [], "currentSceneUrl": "", "character_portrait_data": {}}
+
+     # Debug: Print the raw chapter
+    print(f"Received chapter length: {len(fullChapter)}")
+    print(f"Line breaks found: {fullChapter.count(chr(10))}")  # \n
+    print(f"Double line breaks found: {fullChapter.count(chr(10) + chr(10))}")  # \n\n
+    print(f"First 200 chars: {repr(fullChapter[:200])}")
+
+    scenes = [p.strip() for p in re.split(r'(?:\r?\n){2,}', fullChapter) if p.strip()]
+    # scenes = [p.strip() for p in fullChapter.strip().split("\n\n") if p.strip()]
+    return {"scenes":scenes, "characters": [], "new_characters": [], "character_portrait": {}, "character_prompts": [], "currentSceneUrl": ""}
 
   def get_characters(self,state):
+    print("get charecters node")
     debug_state(self,state)
 
     fullChapter = state["fullChapter"]
@@ -180,7 +190,9 @@ class Agent:
     print("Creating Character Prompts")
     new_characters = []
     current_scene_characters = state["currentSceneData"].characters
+    print("current scene charecters = ", current_scene_characters)
     characters = state["characters"]
+    print("all characters = " , characters)
     fullChapter = state['fullChapter']
     for character in current_scene_characters:
       if character not in characters:
@@ -267,7 +279,7 @@ class Agent:
 
       result = self.gemini.invoke(prompt)
       character_prompts.append(result)
-      characters.append(character)
+      characters.append(chr)
 
     return {"character_prompts": character_prompts, "characters": characters, "new_characters": new_characters}
 
@@ -277,7 +289,6 @@ class Agent:
 
     character_prompts = state["character_prompts"]
     allImages = state["character_portrait"]
-    allImageData = state["character_portrait_data"]
 
     def _get_image_base64(response: AIMessage) -> None:
       image_block = next(
@@ -298,13 +309,13 @@ class Agent:
       )
       image_base64 = _get_image_base64(response)
       image_data = base64.b64decode(image_base64)
-      file_name = "Character:"+ str(i)
+      file_name = characters[i]
       bucket = characterPortraitBucket
+      print("uploading charecter : "+ file_name)
       url = self.uploadImage(file_name, image_data, bucket)
       allImages[characters[i]] = url
-      allImageData[characters[i]] = image_data
 
-    return {"character_portrait" : allImages, "character_portrait_data": allImageData}
+    return {"character_portrait" : allImages}
 
   def generate_scene_prompt(self, state):
     print("Generating scene prompt")
@@ -453,7 +464,7 @@ class Agent:
 
   def check_completion(self,state):
     if self.currentScene_counter == len(state["scenes"])-1:
-      # All scenes completed
+      print("All scenes are completed")
       if self.connection_id and self.connection_id in active_connections:
         final_data = {
           "total_scenes": len(state["scenes"]),
@@ -466,6 +477,7 @@ class Agent:
           pass
       return True
     else:
+      print("cycle completed")
       if self.connection_id and self.connection_id in active_connections:
         scene_completed_data = {
           "scene_id": self.currentScene_counter,
@@ -480,6 +492,13 @@ class Agent:
           pass
       self.currentScene_counter += 1
       return False
+    
+def clean_supabase():
+    supabase.storage.empty_bucket(characterPortraitBucket)
+    supabase.storage.empty_bucket(sceneImageBucket)
+    
+    supabase.table("scenes").delete().gte("id", 0).execute()
+    return
 
 def debug_state(self, state):
     print(f"Current scene counter: {self.currentScene_counter}")
@@ -525,8 +544,8 @@ async def process_chapter_with_updates(fullChapter: str, connection_id: str):
     try:
         result = main(fullChapter, connection_id)
         # Process completed, cleanup
-        if connection_id in active_connections:
-            del active_connections[connection_id]
+        # if connection_id in active_connections:
+        #     del active_connections[connection_id]
     except Exception as e:
         # Send error notification
         if connection_id in active_connections:
