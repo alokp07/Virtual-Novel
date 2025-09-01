@@ -42,6 +42,7 @@ characterPortraitBucket = "Character_Portraits"
 
 GeminiAPI_key = os.getenv("GeminiAPI_key")
 IMAGE_GEMINI_API = os.getenv("IMAGE_GEMINI_API")
+OPENROUTER_API="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"
 
 fastAPI = FastAPI()
 fastAPI.add_middleware(
@@ -313,7 +314,8 @@ class Agent:
       bucket = characterPortraitBucket
       print("uploading charecter : "+ file_name)
       url = self.uploadImage(file_name, image_data, bucket)
-      allImages[characters[i]] = url
+      encoded_url = urllib.parse.quote(url, safe=":/?&=")
+      allImages[characters[i]] = encoded_url
 
     return {"character_portrait" : allImages}
 
@@ -322,9 +324,9 @@ class Agent:
     fullChapter = state["fullChapter"]
     currentScene = state["scenes"][self.currentScene_counter]
     previousSceneImage = state.get("currentSceneUrl", "")
-    characterPortraits = []
+    characterPortraits = {}
     for character in state['currentSceneData'].characters:
-        characterPortraits.append(state['character_portrait'][character])
+        characterPortraits[character]=state['character_portrait'][character]
 
     prompt = f"""
             You are a master anime illustrator and expert prompt engineer. Your task is to generate an **ultra-high-quality Full HD anime scene** (1920x1080 pixels, 16:9 ratio) based on the novel context. The image must achieve **professional anime studio quality with consistent resolution, flawless character faces, and richly detailed environments.**
@@ -377,7 +379,7 @@ class Agent:
             - No blurry elements, no low-resolution output, no distorted features.
 
           """
-
+   
     result = self.gemini.invoke(prompt)
     return {"current_scene_prompt": result.content}
 
@@ -388,41 +390,32 @@ class Agent:
     current_scene_prompt = state["current_scene_prompt"]
     temp = "Generate an Anime Style Image"
     current_scene_prompt = temp + current_scene_prompt
-
-    fullChapter = state["fullChapter"]
-    currentScene = state["scenes"][self.currentScene_counter]
-    previousSceneImage = state.get("currentSceneUrl", "")
-    characterPortraits = []
-    public_url = ""
+    characterPortraits = {}
     for character in state['currentSceneData'].characters:
-        characterPortraits.append(state['character_portrait'][character])
+        characterPortraits[character]=state['character_portrait'][character]
 
-
-    pollinations_params = {
-        "width": 1280,
-        "height": 720,
-        "seed": 41,
-        "model": "flux",
-        "nologo": "true",
-        "image": characterPortraits
-    }
-    encoded_prompt = urllib.parse.quote(current_scene_prompt)
-    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
 
     try:
-        response = requests.get(url, params=pollinations_params, timeout=300) 
-        response.raise_for_status()
+        # response = generate_image(current_scene_prompt, OPENROUTER_API, characterPortraits)
+        # response = upload_with_pollination(current_scene_prompt)
+
+        message = {
+          "role": "user",
+          "content": "Generate an Image \n" + current_scene_prompt ,
+        }
+
+        response = generateImage_gemini(self.image_model,message)
+        file_bytes = response
         file_name = "Scene:" + str(self.currentScene_counter)
-        file_bytes = response.content
         bucket = sceneImageBucket
         upload_response = self.uploadImage(file_name, file_bytes, bucket)
-
+        
     except requests.exceptions.RequestException as e:
         print(f"Error fetching image: Retrying")
-        response = requests.get(url, params=pollinations_params, timeout=300) 
-        response.raise_for_status()
+
+        response = generate_image(current_scene_prompt, OPENROUTER_API, characterPortraits)
+        file_bytes = response
         file_name = "Scene:" + str(self.currentScene_counter)
-        file_bytes = response.content
         bucket = sceneImageBucket
         upload_response = self.uploadImage(file_name, file_bytes, bucket)
 
@@ -439,7 +432,7 @@ class Agent:
     # Check if upload was successful
     if upload_response:
         # Get the public URL
-        public_url = supabase.storage.from_(sceneImageBucket).get_public_url(file_name)
+        public_url = supabase.storage.from_(bucket).get_public_url(file_name)
         print(f"Image URL: {public_url}")
     else:
         print("Upload failed")
@@ -492,7 +485,58 @@ class Agent:
           pass
       self.currentScene_counter += 1
       return False
+
+def upload_with_pollination(prompt):
+
+  pollinations_params = {
+        "width": 1280,
+        "height": 720,
+        "seed": 41,
+        "model": "flux",
+        "nologo": "true"
+    }
+  encoded_prompt = urllib.parse.quote(prompt)
+  url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+  try:
+    response = requests.get(url, params=pollinations_params, timeout=300) 
+    response.raise_for_status()
+    file_bytes = response.content
+    return file_bytes
+  
+  except requests.exceptions.RequestException as e:
+    print(f"Error fetching image: Retrying")
     
+    response = requests.get(url, params=pollinations_params, timeout=300) 
+    response.raise_for_status()
+    file_bytes = response.content
+    return file_bytes
+
+def generateImage_gemini(image_model, message):
+    print("inside gemini image generation function")
+
+    def _get_image_base64(response):
+      image_block = next(
+          block
+          for block in response.content
+          if isinstance(block, dict) and block.get("image_url")
+      )
+      return image_block["image_url"].get("url").split(",")[-1]
+    
+    try:
+      response = image_model.invoke(
+        [message],
+        generation_config=dict(response_modalities=["TEXT", "IMAGE"]),
+      )
+
+      if(response.content):
+        image_base64 = _get_image_base64(response)
+        image_data = base64.b64decode(image_base64)
+        return image_data
+    except Exception as e:
+      print(f"Error in generateImage_gemini: {e}")
+      raise
+
+
 def clean_supabase():
     supabase.storage.empty_bucket(characterPortraitBucket)
     supabase.storage.empty_bucket(sceneImageBucket)
@@ -507,6 +551,77 @@ def debug_state(self, state):
     print(f"New characters: {len(state.get('new_characters', []))}")
     print(f"Character prompts: {len(state.get('character_prompts', []))}")
     print("=" * 30)
+
+def generate_image(prompt: str, api_key: str, portraitData) -> str:
+    """
+    Generate an image using OpenRouter API and return it as a base64 string.
+
+    :param prompt: The text prompt describing the image.
+    :param api_key: Your OpenRouter API key.
+    :return: Base64 string of the generated image.
+    """
+
+    characterNamePrompt = ""
+    
+    i = 1
+    imageUrl = []
+
+    for name, url in portraitData.items():
+      temp = {
+        "type": "image_url",
+        "image_url": {
+          "url": url
+        }
+      }
+      imageUrl.append(temp)
+
+      characterNamePrompt += f"The {i}th image is of {name}. "
+      i += 1
+
+    temp = {
+                "type": "text",
+                "text": f"Generate an image of {prompt} in ultra high quality. Given below are the charecter portraits for the characters in this image use those referance to create that character in the image. {characterNamePrompt} Avoid: cropped characters, partially visible figures, characters cut off at edges, poor character framing, obscured main subjects and make sure the resoulution is 1920*1080"
+          }
+    imageUrl.insert(0,temp)
+      
+    response = requests.post(
+      url="https://openrouter.ai/api/v1/chat/completions",
+      headers={
+        "Authorization": "Bearer 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",
+        "Content-Type": "application/json",
+      },
+      data=json.dumps({
+        "model": "google/gemini-2.5-flash-image-preview:free",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+               {
+                "type": "text",
+                "text": f"{prompt}"
+          }
+            ]
+          }
+        ],
+
+      })
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    try:
+        # Extract the base64 image data from the response content
+      response_data = json.loads(response.content.decode('utf-8'))
+      image_data_url = response_data['choices'][0]['message']['images'][0]['image_url']['url']
+
+      # Remove the "data:image/png;base64," prefix
+      base64_string = image_data_url.split(',')[1]
+
+      # Decode the base64 string
+      image_bytes = base64.b64decode(base64_string)
+      return image_bytes
+    except (KeyError, IndexError) as e:
+        raise ValueError(f"Failed to extract image from response: {data}") from e
 
 
 def main(fullChapter, connection_id: str = None):
